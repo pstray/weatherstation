@@ -1,0 +1,203 @@
+#! /usr/bin/perl
+
+use strict;
+
+use Getopt::Long;
+
+use POSIX qw(pause strftime);
+use Time::HiRes qw(setitimer ITIMER_REAL);
+
+my $opt_pidfile = "/var/run/weatherd.pid";
+my $opt_script = undef;
+my $opt_datalog = undef;
+my $opt_debug = 0;
+
+Getopt::Long(
+	     "p|pidfile=s" => \$opt_pidfile,
+	     "s|script=s" => \$opt_script,
+	     "l|log=s" => \$opt_datalog,
+	     "d|debug++" => \$opt_debug,
+	    );
+
+if (defined $opt_pidfile) {
+    if (-e $pidfile) {
+	open my $pf, "<", $pidfile;
+	while (<$pf>) {
+	    chomp;
+	    $pid = $_;       
+	}
+	close $pf;
+	if (kill 0, $pid) {
+	    printf STDERR "Already running unser pid $pid\n";
+	    exit 0;
+	}
+    }
+    open my $pf, ">", $opt_pidfile;
+}
+
+my $running = 1;
+$SIG{INT} = $SIG{TERM} = sub { $running = 0 };
+$SIG{ALRM} = sub { };
+
+$| = 1;
+
+my $ws = WH1080->new();
+
+while ($running) {
+    my $time = time;
+    my $ts = strftime("%F %T", localtime $time);
+
+    unless ($ws->isopen()) {
+	printf "[%s] Connecting...\n", $ts;
+	unless ($ws->open()) {
+	    printf "[%s]   error: %s\n", $ts, $ws->{_error};
+	    sleep 5;
+	    redo;
+	} 
+    }
+    
+    # first, read the fixed block at pos 0 (actually 256 bytes)
+    my $head = $ws->read_block(0);
+
+    printf "[%s] head @%04x [%s]\n", $ts, 0, unpack("H*". $head);
+
+    unless (32 == length $head) {
+	printf "[%s] head: bad length, %d bytes\n", $ts, length $head;
+	$ws->close();
+	sleep 5;
+	redo;
+    }
+
+    my($id,$current_block) = unpack "nx28S", $head;
+
+    
+
+    
+    
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package WH1080;
+
+use constant {
+	      WriteCommand     => 0xA0,
+	      ReadCommand      => 0xA1,
+	      WriteCommandWord => 0xA2,
+	      EndMark          => 0x20,
+
+	      wsIdVendor  => 0x1941,
+	      wsIdProduct => 0x8021,
+	     };
+
+sub new {
+    my $ref = shift;
+    my $class = ref($ref) || __PACKAGE__;
+    my $self = bless {}, $class;
+
+    $self->{_usb} = Device::USB->new();
+
+    return $self;
+}
+
+sub isopen {
+    my $self = shift;
+    return $self->{_dev};
+}
+
+sub open {
+    my $self = shift;
+
+    my $dev =
+      $self->{_usb}->find_device(wsIdVendor, wsIdProduct);
+
+    # find the device
+    unless ($dev) {
+	$self->{_error} = sprintf("Could not find device %04x:%04x\n",
+				  wsIdVendor, wsIdProduct,
+				 );
+	return;
+    }
+
+    # open it
+    unless ($dev->open()) {
+	$self->{_error} = sprintf("Could not open device %04x:%04x: %s\n",
+				  wsIdVendor, wsIdProduct, $!,
+				 );
+	return;
+    }
+
+    # find driver and relese it from the kernel
+    my $np = $dev->get_driver_np(0);
+    if (defined $np) {
+        $dev->detach_kernel_driver_np(0);
+    }
+
+    # ... so we can claim it
+    if ($dev->claim_interface(0) < 0) {
+        printf "Could not claim interface: $!\n";
+        return;
+    }
+
+    $dev->set_altinterface(0);
+
+    $self->{_dev} = $dev;
+    return $dev;
+}
+
+sub close {
+    my $self = shift;
+    my $dev = delete $self->{_dev};
+    $dev->release_interface(0);
+}
+
+sub read_block {
+    my $self = shift;
+    my($addr) = @_;
+
+    my $buf;
+    my $dev = $self->{_dev};
+
+    return unless $dev;
+
+    my $buf = pack("CnCCnC",
+		   WriteCommandWord, $addr, EndMark,
+		   WriteCommandWord, 0,     EndMark,
+		  );
+
+    my $ret =
+      $dev->control_msg( 0x21, # req_type = USB_TYPE_CLASS | USB_RECIP_INTERFACE
+                         9, # request = REQ_SET_CONFIGURATION
+                         0x200, # value
+                         0, # index
+			 $buf,
+			 length $buf,
+                         1000, # timeout
+                       );
+
+    # printf "  stat: w.ret   = %s\n", $ret;
+    return if $ret<0;
+
+    $ret =
+      $dev->interrupt_read( 0x81, # endpoint
+                            $buf, # buffer
+                            32,   # size
+                            1000, # timeout
+                          );
+    # printf "  stat: r.ret = %s\n", $rest;
+    return if $ret < 0;
+
+    return $buf;
+}
